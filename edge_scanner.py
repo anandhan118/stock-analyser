@@ -6,7 +6,7 @@
 HOW TO RUN:
     streamlit run edge_scanner.py
 REQUIRES:
-    pip install streamlit yfinance pandas plotly openpyxl
+    pip install streamlit yfinance pandas numpy plotly openpyxl
 """
 
 import io
@@ -14,6 +14,8 @@ import json
 import os
 import warnings
 warnings.filterwarnings("ignore")
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import streamlit as st
 import yfinance as yf
@@ -183,6 +185,7 @@ NIFTY200 = [
 
 WATCHLIST_FILE = "watchlist.json"
 JOURNAL_FILE   = "journal.json"
+NIFTY500_URL   = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 
 # ── Resolve paths relative to this script's own folder ────────
 # This ensures watchlist.json and journal.json are always saved
@@ -201,6 +204,40 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_nifty500_symbols():
+    """
+    Load the current Nifty 500 symbols from NSE Indices.
+    Falls back to the bundled list if the index CSV is temporarily unavailable.
+    """
+    try:
+        req = Request(
+            NIFTY500_URL,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/csv,*/*",
+                "Referer": "https://www.niftyindices.com/",
+            },
+        )
+        with urlopen(req, timeout=20) as response:
+            csv_text = response.read().decode("utf-8-sig")
+
+        df = pd.read_csv(io.StringIO(csv_text))
+        symbol_col = next((c for c in df.columns if c.strip().lower() == "symbol"), None)
+        if symbol_col is None:
+            raise ValueError("Nifty 500 CSV does not contain a Symbol column")
+
+        symbols = sorted(
+            s.strip().upper()
+            for s in df[symbol_col].dropna().astype(str)
+            if s.strip()
+        )
+        if len(symbols) < 450:
+            raise ValueError("Nifty 500 symbol list looks incomplete")
+        return symbols
+    except (OSError, URLError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+        return sorted(NIFTY200)
 
 # ── Indicator Calculations ────────────────────────────────────
 def calc_sma(series, period):
@@ -648,6 +685,7 @@ def main():
     if "scan_results" not in st.session_state: st.session_state.scan_results = []
     if "watchlist"    not in st.session_state: st.session_state.watchlist    = load_json(WATCHLIST_FILE, [])
     if "journal"      not in st.session_state: st.session_state.journal      = load_json(JOURNAL_FILE, [])
+    index_symbols = load_nifty500_symbols()
 
     # ── Sidebar ───────────────────────────────────────────────
     with st.sidebar:
@@ -668,7 +706,10 @@ def main():
                     unsafe_allow_html=True)
         st.markdown("---")
         st.markdown("### 🔍 Quick Lookup")
-        quick_sym = st.selectbox("Select Stock", [""] + sorted(NIFTY200))
+        st.caption(f"Scanner universe: {len(index_symbols)} stocks")
+        if len(index_symbols) < 450:
+            st.warning("Could not load the live Nifty 500 list, so the app is using the bundled fallback list.")
+        quick_sym = st.selectbox("Select Stock", [""] + index_symbols)
         st.markdown("---")
         st.markdown(f"### 📋 Watchlist ({len(st.session_state.watchlist)})")
         for w in st.session_state.watchlist:
@@ -684,11 +725,11 @@ def main():
     # ══════════════════════════════════════════════════════════
     with tab1:
         st.markdown("## 🔍 Trend Scanner")
-        st.markdown("Scans Nifty 200 stocks using SMA, WMA, RSI, ADX, Volume and pattern detection.")
+        st.markdown("Scans Nifty 500 stocks using SMA, WMA, RSI, ADX, Volume and pattern detection.")
 
         col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
-            scan_mode = st.radio("Scan Mode", ["Full Nifty 200", "Watchlist Only", "Custom List"], horizontal=True)
+            scan_mode = st.radio("Scan Mode", ["Full Nifty 500", "Watchlist Only", "Custom List"], horizontal=True)
         with col2:
             min_score = st.selectbox("Min Score", [5, 6, 7, 8, 9], index=2)
         with col3:
@@ -700,7 +741,7 @@ def main():
         elif scan_mode == "Watchlist Only":
             symbols_to_scan = st.session_state.watchlist
         else:
-            symbols_to_scan = NIFTY200
+            symbols_to_scan = index_symbols
 
         if st.button("▶ RUN SCANNER", use_container_width=True) and symbols_to_scan:
             results  = []
@@ -785,8 +826,8 @@ def main():
         st.markdown("## 📊 Chart Analysis")
         col1, col2 = st.columns([3, 1])
         with col1:
-            chart_sym = st.selectbox("Select Symbol", [""] + sorted(NIFTY200),
-                                      index=NIFTY200.index(quick_sym) + 1 if quick_sym in NIFTY200 else 0)
+            chart_sym = st.selectbox("Select Symbol", [""] + index_symbols,
+                                      index=index_symbols.index(quick_sym) + 1 if quick_sym in index_symbols else 0)
         with col2:
             months     = st.selectbox("History (months)", [3, 6, 9, 12, 14], index=4)
             show_fib   = st.checkbox("Show Fib Levels", value=True)
@@ -844,7 +885,7 @@ def main():
         st.markdown("## 📋 Watchlist")
         col1, col2 = st.columns([3, 1])
         with col1:
-            add_input = st.selectbox("Add stock to watchlist", [""] + sorted(NIFTY200), key="wl_add")
+            add_input = st.selectbox("Add stock to watchlist", [""] + index_symbols, key="wl_add")
         with col2:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("➕ Add", use_container_width=True) and add_input:
@@ -1091,7 +1132,7 @@ def main():
 
         pa_col1, pa_col2, pa_col3 = st.columns([2, 1, 1])
         with pa_col1:
-            pa_sym = st.selectbox("Select Symbol", [""] + sorted(NIFTY200), key="pa_sym")
+            pa_sym = st.selectbox("Select Symbol", [""] + index_symbols, key="pa_sym")
         with pa_col2:
             pa_months  = st.selectbox("History", [3, 6, 9, 12], index=2, key="pa_months")
             fib_window = st.slider("Fib Lookback (bars)", 20, 120, 60, 10)
