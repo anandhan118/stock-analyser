@@ -211,6 +211,7 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_nifty500_symbols():
     """
     Load the current Nifty 500 symbols from NSE Indices.
@@ -320,28 +321,82 @@ def load_nifty500_symbols():
     return sorted(NIFTY200)
 
 
-def update_scan_history(history, results, scan_date=None, keep_days=20):
+def get_scan_period(results, fallback=None):
     """
-    Store daily scan score history for each symbol.
-    Keeps only the latest `keep_days` scan dates.
+    Use the latest completed market bar as the scan period.
+    This keeps weekend refreshes attached to the last trading day.
     """
-    scan_date = scan_date or datetime.today().strftime("%Y-%m-%d")
+    fallback = fallback or datetime.today().strftime("%Y-%m-%d")
+    dates = sorted(
+        str(r.get("data_date"))
+        for r in results
+        if isinstance(r, dict) and r.get("data_date")
+    )
+    return dates[-1] if dates else fallback
+
+
+def scan_history_row(result, scan_date):
+    return {
+        "date": scan_date,
+        "score": int(result.get("score", 0)),
+        "signal": result.get("signal", "-"),
+        "close": result.get("close", 0),
+        "change_pct": result.get("change_pct", 0),
+        "rsi": result.get("rsi", 0),
+        "adx": result.get("adx", 0),
+        "vol_ratio": result.get("vol_ratio", 0),
+        "trend": result.get("trend", "-"),
+        "setup": result.get("setup", "-"),
+        "fib_zone": result.get("fib_zone", "-"),
+        "near_pivot": result.get("near_pivot", "-"),
+    }
+
+
+def normalize_scan_history(history, keep_days=20):
     cleaned = {}
     for sym, series in (history or {}).items():
         if not isinstance(series, list):
             continue
         valid_rows = []
         for row in series:
-            if isinstance(row, dict) and "date" in row and "score" in row:
-                valid_rows.append({"date": str(row["date"]), "score": int(row["score"])})
+            if not isinstance(row, dict) or "date" not in row or "score" not in row:
+                continue
+            valid_rows.append({
+                "date": str(row["date"]),
+                "score": int(row.get("score", 0)),
+                "signal": row.get("signal", "-"),
+                "close": row.get("close", 0),
+                "change_pct": row.get("change_pct", 0),
+                "rsi": row.get("rsi", 0),
+                "adx": row.get("adx", 0),
+                "vol_ratio": row.get("vol_ratio", 0),
+                "trend": row.get("trend", "-"),
+                "setup": row.get("setup", "-"),
+                "fib_zone": row.get("fib_zone", "-"),
+                "near_pivot": row.get("near_pivot", "-"),
+            })
         if valid_rows:
-            cleaned[sym] = valid_rows
+            cleaned[sym] = sorted(valid_rows, key=lambda x: x["date"])[-keep_days:]
+    return cleaned
 
-    latest_scores = {r["symbol"]: int(r["score"]) for r in results}
-    for sym, score in latest_scores.items():
+
+def update_scan_history(history, results, scan_date=None, keep_days=20):
+    """
+    Store daily scan score history for each symbol.
+    Keeps only the latest `keep_days` scan dates.
+    """
+    scan_date = scan_date or get_scan_period(results)
+    cleaned = normalize_scan_history(history, keep_days=keep_days)
+
+    latest_results = {
+        r["symbol"]: scan_history_row(r, scan_date)
+        for r in results
+        if isinstance(r, dict) and r.get("symbol")
+    }
+    for sym, row in latest_results.items():
         sym_hist = cleaned.get(sym, [])
         sym_hist = [x for x in sym_hist if x["date"] != scan_date]
-        sym_hist.append({"date": scan_date, "score": score})
+        sym_hist.append(row)
         sym_hist = sorted(sym_hist, key=lambda x: x["date"])
         cleaned[sym] = sym_hist[-keep_days:]
 
@@ -353,20 +408,28 @@ def update_scan_store(scan_store, results, scan_date=None, keep_days=20):
     Persist full scan snapshots by date so last results are available on next app open.
     Keeps only last `keep_days` scan dates.
     """
-    scan_date = scan_date or datetime.today().strftime("%Y-%m-%d")
+    scan_date = scan_date or get_scan_period(results)
     scans = scan_store.get("scans", []) if isinstance(scan_store, dict) else []
     scans = [s for s in scans if isinstance(s, dict) and "date" in s and "results" in s]
     scans = [s for s in scans if str(s["date"]) != scan_date]
-    scans.append({"date": scan_date, "results": results})
+    scans.append({
+        "date": scan_date,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "results": results,
+    })
     scans = sorted(scans, key=lambda x: str(x["date"]))[-keep_days:]
     return {"scans": scans}
 
 
-def get_latest_scan_results(scan_store):
+def get_latest_scan_snapshot(scan_store):
     scans = scan_store.get("scans", []) if isinstance(scan_store, dict) else []
     if not scans:
-        return []
-    latest = sorted(scans, key=lambda x: str(x.get("date", "")))[-1]
+        return {}
+    return sorted(scans, key=lambda x: str(x.get("date", "")))[-1]
+
+
+def get_latest_scan_results(scan_store):
+    latest = get_latest_scan_snapshot(scan_store)
     return latest.get("results", []) if isinstance(latest, dict) else []
 
 
@@ -394,6 +457,63 @@ def build_consistent_high_score_df(history, min_score=6, min_days=10, lookback_d
     fixed_cols = ["Symbol", f"Days >= {min_score}"]
     date_cols = sorted([c for c in out.columns if c not in fixed_cols])
     return out[fixed_cols + date_cols]
+
+
+def build_score_history_df(history, lookback_days=20):
+    """
+    Build a rolling score matrix for every symbol in history.
+    Columns are the latest trading periods and values are final scan points.
+    """
+    rows = []
+    cleaned = normalize_scan_history(history, keep_days=lookback_days)
+    for sym, series in cleaned.items():
+        last_n = sorted(series, key=lambda x: x["date"])[-lookback_days:]
+        if not last_n:
+            continue
+        row = {
+            "Symbol": sym,
+            "Periods": len(last_n),
+            "Latest Score": int(last_n[-1]["score"]),
+            "Latest Signal": last_n[-1].get("signal", "-"),
+            "Latest Trend": last_n[-1].get("trend", "-"),
+            "Latest Setup": last_n[-1].get("setup", "-"),
+        }
+        for item in last_n:
+            row[item["date"]] = int(item["score"])
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values(
+        by=["Latest Score", "Symbol"], ascending=[False, True]
+    )
+    fixed_cols = ["Symbol", "Periods", "Latest Score", "Latest Signal", "Latest Trend", "Latest Setup"]
+    date_cols = sorted([c for c in out.columns if c not in fixed_cols])
+    return out[fixed_cols + date_cols]
+
+
+def build_symbol_history_df(history, symbol, lookback_days=20):
+    series = normalize_scan_history(history, keep_days=lookback_days).get(symbol, [])
+    if not series:
+        return pd.DataFrame()
+    rows = []
+    for row in sorted(series, key=lambda x: x["date"])[-lookback_days:]:
+        rows.append({
+            "Date": row["date"],
+            "Final Points": int(row["score"]),
+            "Signal": row.get("signal", "-"),
+            "Close": row.get("close", 0),
+            "Chg%": row.get("change_pct", 0),
+            "RSI": row.get("rsi", 0),
+            "ADX": row.get("adx", 0),
+            "Vol Ratio": row.get("vol_ratio", 0),
+            "Trend": row.get("trend", "-"),
+            "Setup": row.get("setup", "-"),
+            "Fib Zone": row.get("fib_zone", "-"),
+            "Near Pivot": row.get("near_pivot", "-"),
+        })
+    return pd.DataFrame(rows)
 
 # ── Indicator Calculations ────────────────────────────────────
 def calc_sma(series, period):
@@ -675,7 +795,9 @@ def analyze(symbol, df):
     else:                                                    signal = "AVOID"
 
     return {
-        "symbol": symbol, "close": round(last, 2), "change_pct": change_pct,
+        "symbol": symbol,
+        "data_date": df.index[-1].strftime("%Y-%m-%d") if hasattr(df.index[-1], "strftime") else str(df.index[-1])[:10],
+        "close": round(last, 2), "change_pct": change_pct,
         "sma20": round(sma20, 2), "sma50": round(sma50, 2), "sma200": round(sma200, 2),
         "wma10": round(wma10, 2), "wma30": round(wma30, 2),
         "rsi": round(rsi_v, 1), "atr": round(atr_v, 2), "adx": round(adx_v, 1),
@@ -844,7 +966,8 @@ def color_score(val):
 def main():
     if "scan_store"   not in st.session_state: st.session_state.scan_store   = load_json(SCAN_STORE_FILE, {"scans": []})
     if "scan_results" not in st.session_state: st.session_state.scan_results = get_latest_scan_results(st.session_state.scan_store)
-    if "scan_history" not in st.session_state: st.session_state.scan_history = load_json(SCAN_HISTORY_FILE, {})
+    if "scan_history" not in st.session_state:
+        st.session_state.scan_history = normalize_scan_history(load_json(SCAN_HISTORY_FILE, {}), keep_days=20)
     index_symbols = load_nifty500_symbols()
 
     # ── Sidebar ───────────────────────────────────────────────
@@ -874,6 +997,15 @@ def main():
         st.markdown("## 🔍 Trend Scanner")
         st.markdown("Scans Nifty 500 stocks using SMA, WMA, RSI, ADX, Volume and pattern detection.")
 
+        latest_scan = get_latest_scan_snapshot(st.session_state.scan_store)
+        if latest_scan:
+            saved_at = latest_scan.get("saved_at", "saved earlier")
+            st.markdown(f"""<div class='info-box'>
+                Loaded saved scanner data for <b>{latest_scan.get('date', '-')}</b>.
+                Browser refreshes will open this cached report immediately. Run scanner again to refresh the latest market period.
+                <br><b>Last saved:</b> {saved_at}
+            </div>""", unsafe_allow_html=True)
+
         col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             scan_mode = st.radio("Scan Mode", ["Full Nifty 500", "Custom List"], horizontal=True)
@@ -888,7 +1020,7 @@ def main():
         else:
             symbols_to_scan = index_symbols
 
-        if st.button("▶ RUN SCANNER", width="stretch") and symbols_to_scan:
+        if st.button("▶ RUN / REFRESH SCANNER", width="stretch") and symbols_to_scan:
             results  = []
             failed_symbols = []
             progress = st.progress(0, text="Starting scan...")
@@ -906,15 +1038,16 @@ def main():
             st.session_state.scan_results = sorted(
                 results, key=lambda x: (["BUY","WATCH","AVOID"].index(x["signal"]), -x["score"])
             )
+            scan_period = get_scan_period(st.session_state.scan_results)
             st.session_state.scan_history = update_scan_history(
-                st.session_state.scan_history, st.session_state.scan_results, keep_days=20
+                st.session_state.scan_history, st.session_state.scan_results, scan_date=scan_period, keep_days=20
             )
             st.session_state.scan_store = update_scan_store(
-                st.session_state.scan_store, st.session_state.scan_results, keep_days=20
+                st.session_state.scan_store, st.session_state.scan_results, scan_date=scan_period, keep_days=20
             )
             save_json(SCAN_HISTORY_FILE, st.session_state.scan_history)
             save_json(SCAN_STORE_FILE, st.session_state.scan_store)
-            st.success(f"✅ Scan complete — attempted {len(symbols_to_scan)} stocks | analyzed {len(results)} stocks")
+            st.success(f"✅ Scan complete for {scan_period} — attempted {len(symbols_to_scan)} stocks | analyzed {len(results)} stocks")
 
             if failed_symbols:
                 st.warning("Skipped symbols with analysis errors: " + ", ".join(failed_symbols))
@@ -974,6 +1107,35 @@ def main():
                 chart_df = consistent_df.set_index("Symbol")[date_cols].T
                 chart_df.index = pd.to_datetime(chart_df.index)
                 st.line_chart(chart_df, width="stretch")
+
+            st.markdown("### ðŸ“‹ Rolling 20-Period Score Report")
+            st.caption("Final scanner points for every saved trading period. Each refresh loads this saved report first.")
+            score_history_df = build_score_history_df(
+                st.session_state.get("scan_history", {}),
+                lookback_days=20
+            )
+            if score_history_df.empty:
+                st.info("Run the scanner once to start building the rolling 20-period report.")
+            else:
+                st.dataframe(score_history_df, width="stretch", height=420, hide_index=True)
+
+                hist_symbols = score_history_df["Symbol"].tolist()
+                selected_hist_symbol = st.selectbox(
+                    "Analyse stock score history",
+                    hist_symbols,
+                    key="score_history_symbol"
+                )
+                symbol_history_df = build_symbol_history_df(
+                    st.session_state.get("scan_history", {}),
+                    selected_hist_symbol,
+                    lookback_days=20
+                )
+                if not symbol_history_df.empty:
+                    st.dataframe(symbol_history_df, width="stretch", hide_index=True)
+                    st.line_chart(
+                        symbol_history_df.set_index("Date")[["Final Points"]],
+                        width="stretch"
+                    )
 
     # ══════════════════════════════════════════════════════════
     # TAB 2 — CHART ANALYSIS
