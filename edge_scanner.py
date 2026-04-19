@@ -12,6 +12,7 @@ REQUIRES:
 import io
 import json
 import os
+import time
 import warnings
 warnings.filterwarnings("ignore")
 from urllib.error import URLError
@@ -21,7 +22,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+import requests
+import plotly.graph_objects as goitgit
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
@@ -183,16 +185,20 @@ NIFTY200 = [
     "YESBANK","ZOMATO","ZYDUSLIFE"
 ]
 
-WATCHLIST_FILE = "watchlist.json"
-JOURNAL_FILE   = "journal.json"
+SCAN_HISTORY_FILE = "scan_history.json"
+SCAN_STORE_FILE = "scan_store.json"
 NIFTY500_URL   = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+NSE_ARCHIVE_NIFTY500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+NSE_HOME_URL = "https://www.nseindia.com/"
+WIKIPEDIA_NIFTY500_URL = "https://en.wikipedia.org/wiki/NIFTY_500"
+NSE_EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
 # ── Resolve paths relative to this script's own folder ────────
-# This ensures watchlist.json and journal.json are always saved
+# This ensures persisted JSON files are always saved
 # next to edge_scanner.py, regardless of where the app is run from.
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-WATCHLIST_FILE = os.path.join(_BASE_DIR, "watchlist.json")
-JOURNAL_FILE   = os.path.join(_BASE_DIR, "journal.json")
+SCAN_HISTORY_FILE = os.path.join(_BASE_DIR, "scan_history.json")
+SCAN_STORE_FILE = os.path.join(_BASE_DIR, "scan_store.json")
 
 # ── Persistence Helpers ───────────────────────────────────────
 def load_json(path, default):
@@ -205,39 +211,189 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def load_nifty500_symbols():
     """
     Load the current Nifty 500 symbols from NSE Indices.
     Falls back to the bundled list if the index CSV is temporarily unavailable.
     """
-    try:
-        req = Request(
-            NIFTY500_URL,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "text/csv,*/*",
-                "Referer": "https://www.niftyindices.com/",
-            },
-        )
-        with urlopen(req, timeout=20) as response:
-            csv_text = response.read().decode("utf-8-sig")
-
+    def parse_symbols_from_csv(csv_text):
         df = pd.read_csv(io.StringIO(csv_text))
         symbol_col = next((c for c in df.columns if c.strip().lower() == "symbol"), None)
         if symbol_col is None:
-            raise ValueError("Nifty 500 CSV does not contain a Symbol column")
-
-        symbols = sorted(
+            return []
+        return sorted(
             s.strip().upper()
             for s in df[symbol_col].dropna().astype(str)
             if s.strip()
         )
-        if len(symbols) < 450:
-            raise ValueError("Nifty 500 symbol list looks incomplete")
-        return symbols
-    except (OSError, URLError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
-        return sorted(NIFTY200)
+
+    def parse_symbols_from_tables(tables):
+        candidates = []
+        symbol_col_aliases = {
+            "symbol", "ticker", "nse code", "nse symbol", "code", "stock code"
+        }
+        for table in tables:
+            if not isinstance(table, pd.DataFrame) or table.empty:
+                continue
+            normalized_cols = {str(c).strip().lower(): c for c in table.columns}
+            match_col = None
+            for alias in symbol_col_aliases:
+                if alias in normalized_cols:
+                    match_col = normalized_cols[alias]
+                    break
+            if match_col is None:
+                continue
+            raw = table[match_col].dropna().astype(str)
+            for item in raw:
+                sym = item.strip().upper()
+                # keep NSE-style symbols only
+                if sym and sym.replace("&", "").replace("-", "").replace(".", "").isalnum():
+                    candidates.append(sym)
+        return sorted(set(candidates))
+
+    def fetch_csv_via_urllib(url, referer):
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/csv,*/*",
+                "Referer": referer,
+            },
+        )
+        with urlopen(req, timeout=20) as response:
+            return response.read().decode("utf-8-sig")
+
+    def fetch_csv_via_requests(url, referer):
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv,*/*",
+            "Referer": referer,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        with requests.Session() as session:
+            # Warm up cookies to reduce 403 blocks from NSE endpoints.
+            session.get(NSE_HOME_URL, headers=headers, timeout=20)
+            response = session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            return response.text
+
+    sources = [
+        {"url": NIFTY500_URL, "referer": "https://www.niftyindices.com/"},
+        {"url": NSE_ARCHIVE_NIFTY500_URL, "referer": "https://www.nseindia.com/"},
+    ]
+    for src in sources:
+        try:
+            csv_text = fetch_csv_via_urllib(src["url"], src["referer"])
+            symbols = parse_symbols_from_csv(csv_text)
+            if len(symbols) >= 450:
+                return symbols
+        except (OSError, URLError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+            pass
+
+        try:
+            csv_text = fetch_csv_via_requests(src["url"], src["referer"])
+            symbols = parse_symbols_from_csv(csv_text)
+            if len(symbols) >= 450:
+                return symbols
+        except (requests.RequestException, OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+            continue
+
+    # Fallback source: Wikipedia table often remains reachable when NSE endpoints are blocked.
+    try:
+        wiki_tables = pd.read_html(WIKIPEDIA_NIFTY500_URL, match="NIFTY 500|Nifty 500")
+        wiki_symbols = parse_symbols_from_tables(wiki_tables)
+        if len(wiki_symbols) >= 450:
+            return wiki_symbols
+    except (ValueError, OSError, ImportError, pd.errors.ParserError):
+        pass
+
+    # Last-resort universe source: all NSE listed equity symbols.
+    # If available, we use first 500 symbols so full scan mode can still run 500 names.
+    try:
+        equity_csv = fetch_csv_via_requests(NSE_EQUITY_LIST_URL, "https://www.nseindia.com/")
+        equity_symbols = parse_symbols_from_csv(equity_csv)
+        if len(equity_symbols) >= 500:
+            return equity_symbols[:500]
+    except (requests.RequestException, OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+        pass
+
+    return sorted(NIFTY200)
+
+
+def update_scan_history(history, results, scan_date=None, keep_days=20):
+    """
+    Store daily scan score history for each symbol.
+    Keeps only the latest `keep_days` scan dates.
+    """
+    scan_date = scan_date or datetime.today().strftime("%Y-%m-%d")
+    cleaned = {}
+    for sym, series in (history or {}).items():
+        if not isinstance(series, list):
+            continue
+        valid_rows = []
+        for row in series:
+            if isinstance(row, dict) and "date" in row and "score" in row:
+                valid_rows.append({"date": str(row["date"]), "score": int(row["score"])})
+        if valid_rows:
+            cleaned[sym] = valid_rows
+
+    latest_scores = {r["symbol"]: int(r["score"]) for r in results}
+    for sym, score in latest_scores.items():
+        sym_hist = cleaned.get(sym, [])
+        sym_hist = [x for x in sym_hist if x["date"] != scan_date]
+        sym_hist.append({"date": scan_date, "score": score})
+        sym_hist = sorted(sym_hist, key=lambda x: x["date"])
+        cleaned[sym] = sym_hist[-keep_days:]
+
+    return cleaned
+
+
+def update_scan_store(scan_store, results, scan_date=None, keep_days=20):
+    """
+    Persist full scan snapshots by date so last results are available on next app open.
+    Keeps only last `keep_days` scan dates.
+    """
+    scan_date = scan_date or datetime.today().strftime("%Y-%m-%d")
+    scans = scan_store.get("scans", []) if isinstance(scan_store, dict) else []
+    scans = [s for s in scans if isinstance(s, dict) and "date" in s and "results" in s]
+    scans = [s for s in scans if str(s["date"]) != scan_date]
+    scans.append({"date": scan_date, "results": results})
+    scans = sorted(scans, key=lambda x: str(x["date"]))[-keep_days:]
+    return {"scans": scans}
+
+
+def get_latest_scan_results(scan_store):
+    scans = scan_store.get("scans", []) if isinstance(scan_store, dict) else []
+    if not scans:
+        return []
+    latest = sorted(scans, key=lambda x: str(x.get("date", "")))[-1]
+    return latest.get("results", []) if isinstance(latest, dict) else []
+
+
+def build_consistent_high_score_df(history, min_score=6, min_days=10, lookback_days=20):
+    """
+    Returns a dataframe with symbols that scored >= min_score on at least
+    `min_days` within their last `lookback_days` entries.
+    """
+    rows = []
+    for sym, series in (history or {}).items():
+        if not isinstance(series, list) or not series:
+            continue
+        last_n = sorted(series, key=lambda x: x["date"])[-lookback_days:]
+        hit_days = sum(1 for x in last_n if int(x["score"]) >= min_score)
+        if hit_days >= min_days:
+            row = {"Symbol": sym, f"Days >= {min_score}": hit_days}
+            for item in last_n:
+                row[item["date"]] = int(item["score"])
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values(by=[f"Days >= {min_score}", "Symbol"], ascending=[False, True])
+    fixed_cols = ["Symbol", f"Days >= {min_score}"]
+    date_cols = sorted([c for c in out.columns if c not in fixed_cols])
+    return out[fixed_cols + date_cols]
 
 # ── Indicator Calculations ────────────────────────────────────
 def calc_sma(series, period):
@@ -379,19 +535,29 @@ def fetch_data(symbol, months=14):
     ticker = f"{symbol}.NS"
     end    = datetime.today()
     start  = end - timedelta(days=months * 31)
-    try:
-        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-        if df is None or df.empty or len(df) < 30:
-            return None
-        # Flatten MultiIndex columns from newer yfinance versions
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        df = df[["Open","High","Low","Close","Volume"]].copy()
-        df.dropna(subset=["Open","High","Low","Close"], inplace=True)
-        df["Volume"] = df["Volume"].fillna(0)
-        return df
-    except Exception:
-        return None
+    retry_waits = [0.0, 1.2, 2.5]
+    for attempt, wait_sec in enumerate(retry_waits, start=1):
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        try:
+            df = yf.download(
+                ticker, start=start, end=end,
+                progress=False, auto_adjust=True, threads=False
+            )
+            if df is None or df.empty or len(df) < 30:
+                continue
+            # Flatten MultiIndex columns from newer yfinance versions
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0] for col in df.columns]
+            df = df[["Open","High","Low","Close","Volume"]].copy()
+            df.dropna(subset=["Open","High","Low","Close"], inplace=True)
+            df["Volume"] = df["Volume"].fillna(0)
+            return df
+        except Exception:
+            if attempt == len(retry_waits):
+                return None
+            continue
+    return None
 
 # ── Stock Analyzer ────────────────────────────────────────────
 def analyze(symbol, df):
@@ -672,19 +838,13 @@ def color_score(val):
     except (TypeError, ValueError):
         return ""
 
-def color_pnl(val):
-    try:
-        return f"color:{'#00c853' if float(val) > 0 else '#d32f2f' if float(val) < 0 else '#c8d8e8'}"
-    except (TypeError, ValueError):
-        return ""
-
 # ══════════════════════════════════════════════════════════════
 #                         MAIN APP
 # ══════════════════════════════════════════════════════════════
 def main():
-    if "scan_results" not in st.session_state: st.session_state.scan_results = []
-    if "watchlist"    not in st.session_state: st.session_state.watchlist    = load_json(WATCHLIST_FILE, [])
-    if "journal"      not in st.session_state: st.session_state.journal      = load_json(JOURNAL_FILE, [])
+    if "scan_store"   not in st.session_state: st.session_state.scan_store   = load_json(SCAN_STORE_FILE, {"scans": []})
+    if "scan_results" not in st.session_state: st.session_state.scan_results = get_latest_scan_results(st.session_state.scan_store)
+    if "scan_history" not in st.session_state: st.session_state.scan_history = load_json(SCAN_HISTORY_FILE, {})
     index_symbols = load_nifty500_symbols()
 
     # ── Sidebar ───────────────────────────────────────────────
@@ -697,27 +857,14 @@ def main():
         <div style='font-size:9px;color:#445566;letter-spacing:2px;margin-bottom:20px;'>NSE SWING TRADING SYSTEM</div>
         """, unsafe_allow_html=True)
 
-        st.markdown("### ⚙️ Settings")
-        capital  = st.number_input("Total Capital (₹)", min_value=10000, max_value=10000000,
-                                    value=500000, step=10000, format="%d")
-        risk_pct = st.slider("Risk per Trade (%)", 0.5, 5.0, 2.0, 0.5)
-        risk_amt = capital * risk_pct / 100
-        st.markdown(f"<div class='info-box'>Max loss per trade: <b>₹{risk_amt:,.0f}</b></div>",
-                    unsafe_allow_html=True)
-        st.markdown("---")
         st.markdown("### 🔍 Quick Lookup")
         st.caption(f"Scanner universe: {len(index_symbols)} stocks")
         if len(index_symbols) < 450:
-            st.warning("Could not load the live Nifty 500 list, so the app is using the bundled fallback list.")
+            st.warning("Could not load live Nifty 500 sources (NSE/backup), so the app is using the bundled fallback list.")
         quick_sym = st.selectbox("Select Stock", [""] + index_symbols)
-        st.markdown("---")
-        st.markdown(f"### 📋 Watchlist ({len(st.session_state.watchlist)})")
-        for w in st.session_state.watchlist:
-            st.markdown(f"• `{w}`")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🔍 TREND SCANNER", "📊 CHART ANALYSIS",
-        "📋 WATCHLIST", "🧮 POSITION SIZER", "📓 TRADE JOURNAL", "📐 PRICE ACTION"
+    tab1, tab2, tab6 = st.tabs([
+        "🔍 TREND SCANNER", "📊 CHART ANALYSIS", "📐 PRICE ACTION"
     ])
 
     # ══════════════════════════════════════════════════════════
@@ -729,7 +876,7 @@ def main():
 
         col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
-            scan_mode = st.radio("Scan Mode", ["Full Nifty 500", "Watchlist Only", "Custom List"], horizontal=True)
+            scan_mode = st.radio("Scan Mode", ["Full Nifty 500", "Custom List"], horizontal=True)
         with col2:
             min_score = st.selectbox("Min Score", [5, 6, 7, 8, 9], index=2)
         with col3:
@@ -738,12 +885,10 @@ def main():
         if scan_mode == "Custom List":
             custom_input    = st.text_area("Enter symbols (one per line or comma separated)", "RELIANCE\nHDFCBANK\nINFY\nTCS")
             symbols_to_scan = [s.strip().upper() for s in custom_input.replace(",", "\n").split("\n") if s.strip()]
-        elif scan_mode == "Watchlist Only":
-            symbols_to_scan = st.session_state.watchlist
         else:
             symbols_to_scan = index_symbols
 
-        if st.button("▶ RUN SCANNER", use_container_width=True) and symbols_to_scan:
+        if st.button("▶ RUN SCANNER", width="stretch") and symbols_to_scan:
             results  = []
             failed_symbols = []
             progress = st.progress(0, text="Starting scan...")
@@ -761,7 +906,15 @@ def main():
             st.session_state.scan_results = sorted(
                 results, key=lambda x: (["BUY","WATCH","AVOID"].index(x["signal"]), -x["score"])
             )
-            st.success(f"✅ Scan complete — {len(results)} stocks analyzed")
+            st.session_state.scan_history = update_scan_history(
+                st.session_state.scan_history, st.session_state.scan_results, keep_days=20
+            )
+            st.session_state.scan_store = update_scan_store(
+                st.session_state.scan_store, st.session_state.scan_results, keep_days=20
+            )
+            save_json(SCAN_HISTORY_FILE, st.session_state.scan_history)
+            save_json(SCAN_STORE_FILE, st.session_state.scan_store)
+            st.success(f"✅ Scan complete — attempted {len(symbols_to_scan)} stocks | analyzed {len(results)} stocks")
 
             if failed_symbols:
                 st.warning("Skipped symbols with analysis errors: " + ", ".join(failed_symbols))
@@ -803,21 +956,24 @@ def main():
                 .map(color_signal, subset=["Signal"])\
                 .map(color_chg,    subset=["Chg%"])\
                 .map(color_score,  subset=["Score"])
-            st.dataframe(styled, use_container_width=True, height=500)
+            st.dataframe(styled, width="stretch", height=500)
 
-            st.markdown("#### ➕ Add to Watchlist")
-            col_a, col_b = st.columns([3, 1])
-            with col_a:
-                add_sym = st.selectbox("Select stock to add", [""] + [r["symbol"] for r in filtered])
-            with col_b:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("Add to Watchlist") and add_sym:
-                    if add_sym not in st.session_state.watchlist:
-                        st.session_state.watchlist.append(add_sym)
-                        save_json(WATCHLIST_FILE, st.session_state.watchlist)
-                        st.success(f"✅ {add_sym} added")
-                    else:
-                        st.info(f"{add_sym} already in watchlist")
+            st.markdown("### 📈 Consistent 20-Day Score Tracker")
+            st.caption("Stocks with score ≥ 6 for at least 10 out of last 20 scan days.")
+            consistent_df = build_consistent_high_score_df(
+                st.session_state.get("scan_history", {}),
+                min_score=6,
+                min_days=10,
+                lookback_days=20
+            )
+            if consistent_df.empty:
+                st.info("No stocks currently match the 10/20 rule yet. Keep running daily scans to build history.")
+            else:
+                st.dataframe(consistent_df, width="stretch", height=300)
+                date_cols = [c for c in consistent_df.columns if c not in ["Symbol", "Days >= 6"]]
+                chart_df = consistent_df.set_index("Symbol")[date_cols].T
+                chart_df.index = pd.to_datetime(chart_df.index)
+                st.line_chart(chart_df, width="stretch")
 
     # ══════════════════════════════════════════════════════════
     # TAB 2 — CHART ANALYSIS
@@ -834,7 +990,7 @@ def main():
             show_pivs  = st.checkbox("Show Pivot Points", value=True)
             piv_method = st.selectbox("Pivot Method", ["Classic", "Woodie", "Camarilla"])
             st.markdown("<br>", unsafe_allow_html=True)
-            load_chart = st.button("📊 Load Chart", use_container_width=True)
+            load_chart = st.button("📊 Load Chart", width="stretch")
 
         if chart_sym and load_chart:
             with st.spinner(f"Loading {chart_sym}..."):
@@ -861,7 +1017,7 @@ def main():
 
                 st.markdown("")
                 st.plotly_chart(build_chart(chart_sym, df, result, show_fib=show_fib,
-                    show_pivots=show_pivs, show_pivot_method=piv_method), use_container_width=True)
+                    show_pivots=show_pivs, show_pivot_method=piv_method), width="stretch")
 
                 st.markdown("#### Moving Average Structure")
                 vals = [result["sma20"], result["sma50"], result["sma200"], result["wma10"], result["wma30"]]
@@ -870,258 +1026,7 @@ def main():
                     "Value":     vals,
                     "vs Price":  [f"{(result['close']-v)/v*100:+.2f}%" for v in vals],
                     "Position":  ["Above ✓" if result["close"] > v else "Below ✗" for v in vals],
-                }), use_container_width=True)
-
-                if st.button(f"➕ Add {chart_sym} to Watchlist"):
-                    if chart_sym not in st.session_state.watchlist:
-                        st.session_state.watchlist.append(chart_sym)
-                        save_json(WATCHLIST_FILE, st.session_state.watchlist)
-                        st.success(f"✅ {chart_sym} added to watchlist")
-
-    # ══════════════════════════════════════════════════════════
-    # TAB 3 — WATCHLIST
-    # ══════════════════════════════════════════════════════════
-    with tab3:
-        st.markdown("## 📋 Watchlist")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            add_input = st.selectbox("Add stock to watchlist", [""] + index_symbols, key="wl_add")
-        with col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("➕ Add", use_container_width=True) and add_input:
-                if add_input not in st.session_state.watchlist:
-                    st.session_state.watchlist.append(add_input)
-                    save_json(WATCHLIST_FILE, st.session_state.watchlist)
-
-        refresh_wl = st.button("🔄 Refresh Watchlist Data", use_container_width=True)
-
-        if st.session_state.watchlist:
-            if refresh_wl:
-                wl_results = []
-                failed_watchlist = []
-                prog = st.progress(0)
-                for i, sym in enumerate(st.session_state.watchlist):
-                    df = fetch_data(sym)
-                    if df is not None:
-                        try:
-                            wl_results.append(analyze(sym, df))
-                        except Exception:
-                            failed_watchlist.append(sym)
-                    prog.progress((i+1)/len(st.session_state.watchlist))
-                prog.empty()
-                st.session_state.wl_results = wl_results
-                if failed_watchlist:
-                    st.warning("Watchlist refresh skipped: " + ", ".join(failed_watchlist))
-
-            wl_results = st.session_state.get("wl_results", [])
-            if wl_results:
-                for r in wl_results:
-                    atr_stop  = r["atr"] * 1.5
-                    qty       = int(risk_amt / atr_stop) if atr_stop > 0 else 0
-                    invest    = qty * r["close"]
-                    icon      = "🟢" if r["signal"]=="BUY" else "🟡" if r["signal"]=="WATCH" else "🔴"
-                    with st.expander(f"{icon} {r['symbol']} — {r['signal']} | Score {r['score']}/10 | ₹{r['close']:,.2f}"):
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("RSI",       r["rsi"])
-                        c2.metric("ADX",       r["adx"])
-                        c3.metric("Vol Ratio", r["vol_ratio"])
-                        c4.metric("ATR",       f"₹{r['atr']:.2f}")
-                        st.markdown(f"""<div class='info-box'>
-                            📐 <b>Position Size (1.5x ATR stop):</b> {qty} shares &nbsp;|&nbsp;
-                            💰 <b>Investment:</b> ₹{invest:,.0f} &nbsp;|&nbsp;
-                            🛑 <b>Stop Loss:</b> ₹{r['close'] - atr_stop:,.2f}
-                        </div>""", unsafe_allow_html=True)
-                        st.markdown(f"**Trend:** {r['trend']} | **Setup:** {r['setup']} | **Aligned:** {'Yes ✓' if r['aligned'] else 'No ✗'}")
-                        if st.button(f"🗑 Remove {r['symbol']}", key=f"rm_{r['symbol']}"):
-                            st.session_state.watchlist.remove(r["symbol"])
-                            save_json(WATCHLIST_FILE, st.session_state.watchlist)
-                            st.rerun()
-            else:
-                for sym in st.session_state.watchlist:
-                    col_s, col_r = st.columns([5, 1])
-                    col_s.markdown(f"• `{sym}`")
-                    if col_r.button("Remove", key=f"rm2_{sym}"):
-                        st.session_state.watchlist.remove(sym)
-                        save_json(WATCHLIST_FILE, st.session_state.watchlist)
-                        st.rerun()
-                st.markdown("<div class='warn-box'>Click <b>🔄 Refresh Watchlist Data</b> to load live prices.</div>",
-                            unsafe_allow_html=True)
-        else:
-            st.info("Your watchlist is empty. Add stocks from the Scanner or Chart tab.")
-
-    # ══════════════════════════════════════════════════════════
-    # TAB 4 — POSITION SIZER
-    # ══════════════════════════════════════════════════════════
-    with tab4:
-        st.markdown("## 🧮 Position Sizer")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("### Trade Inputs")
-            ps_symbol  = st.text_input("Symbol", "RELIANCE").upper()
-            ps_entry   = st.number_input("Entry Price (₹)",    min_value=1.0,  value=2800.0, step=1.0)
-            ps_stop    = st.number_input("Stop Loss Price (₹)", min_value=1.0,  value=2750.0, step=1.0)
-            ps_target  = st.number_input("Target Price (₹)",   min_value=1.0,  value=2950.0, step=1.0)
-            ps_capital = st.number_input("Capital (₹)",        min_value=1000, value=capital, step=1000)
-            ps_risk    = st.slider("Risk %", 0.5, 5.0, risk_pct, 0.5, key="ps_risk")
-
-        with col2:
-            st.markdown("### Results")
-            risk_per_trade = ps_capital * ps_risk / 100
-            risk_per_share = ps_entry - ps_stop
-            reward         = ps_target - ps_entry
-            rr_ratio       = reward / risk_per_share if risk_per_share > 0 else 0
-
-            if risk_per_share <= 0:
-                st.error("❌ Stop loss must be below entry price")
-            else:
-                qty         = int(risk_per_trade / risk_per_share)
-                total_inv   = qty * ps_entry
-                max_loss    = qty * risk_per_share
-                max_profit  = qty * reward
-                capital_pct = total_inv / ps_capital * 100
-
-                st.markdown(f"""<div class='metric-card' style='margin-bottom:10px;'>
-                    <div class='metric-num' style='color:#00c853;'>{qty}</div>
-                    <div class='metric-lbl'>SHARES TO BUY</div></div>""", unsafe_allow_html=True)
-
-                st.dataframe(pd.DataFrame({
-                    "Metric": ["Total Investment","Capital Used %","Risk per Share","Max Loss","Max Profit","Risk:Reward"],
-                    "Value":  [f"₹{total_inv:,.0f}", f"{capital_pct:.1f}%", f"₹{risk_per_share:.2f}",
-                               f"₹{max_loss:,.0f}", f"₹{max_profit:,.0f}", f"{rr_ratio:.2f}:1"]
-                }), use_container_width=True, hide_index=True)
-
-                if rr_ratio < 2:
-                    st.markdown("<div class='warn-box'>⚠️ R:R below 2:1 — consider adjusting target or stop.</div>",
-                                unsafe_allow_html=True)
-                else:
-                    st.markdown(f"<div class='info-box'>✅ Good R:R of {rr_ratio:.1f}:1 — trade meets minimum threshold.</div>",
-                                unsafe_allow_html=True)
-
-                st.markdown("#### ATR-Based Stop Levels")
-                df_ps = fetch_data(ps_symbol)
-                if df_ps is not None:
-                    atr_val  = float(calc_atr(df_ps["High"].astype(float), df_ps["Low"].astype(float), df_ps["Close"].astype(float)).iloc[-1])
-                    atr_rows = []
-                    for mult in [1.0, 1.5, 2.0]:
-                        stop_atr = ps_entry - atr_val * mult
-                        qty_atr  = int(risk_per_trade / (atr_val * mult)) if atr_val > 0 else 0
-                        atr_rows.append({
-                            "ATR Mult": f"{mult}x", "Stop Level": f"₹{stop_atr:.2f}",
-                            "Stop Distance": f"₹{atr_val*mult:.2f}", "Qty": qty_atr,
-                            "Investment": f"₹{qty_atr * ps_entry:,.0f}",
-                        })
-                    st.dataframe(pd.DataFrame(atr_rows), use_container_width=True, hide_index=True)
-
-    # ══════════════════════════════════════════════════════════
-    # TAB 5 — TRADE JOURNAL
-    # ══════════════════════════════════════════════════════════
-    with tab5:
-        st.markdown("## 📓 Trade Journal")
-
-        with st.expander("➕ Log New Trade", expanded=False):
-            jc1, jc2, jc3 = st.columns(3)
-            j_sym    = jc1.text_input("Symbol",   key="j_sym").upper()
-            j_date   = jc1.date_input("Entry Date", key="j_date")
-            j_entry  = jc2.number_input("Entry Price",  min_value=0.01, key="j_entry")
-            j_stop   = jc2.number_input("Stop Loss",    min_value=0.01, key="j_stop")
-            j_target = jc2.number_input("Target",       min_value=0.01, key="j_target")
-            j_qty    = jc3.number_input("Qty", min_value=1, step=1, key="j_qty")
-            j_setup  = jc3.selectbox("Setup",  ["3-Bar Pullback","Range Breakout","WMA Cross","Coiling",
-                                                  "Fib Bounce","Fib Extension","Pivot Range","Pivot Breakout","Other"], key="j_setup")
-            j_status = jc3.selectbox("Status", ["OPEN","CLOSED WIN","CLOSED LOSS"], key="j_status")
-            j_exit   = jc3.number_input("Exit Price (0 if open)", min_value=0.0, key="j_exit")
-            j_notes  = st.text_area("Notes", key="j_notes")
-
-            if st.button("💾 Save Trade"):
-                pnl = (j_exit - j_entry) * j_qty if j_exit > 0 else 0
-                rr  = (j_target - j_entry) / (j_entry - j_stop) if j_entry > j_stop else 0
-                st.session_state.journal.append({
-                    "symbol": j_sym, "date": str(j_date), "entry": j_entry,
-                    "stop": j_stop, "target": j_target, "exit": j_exit,
-                    "qty": j_qty, "setup": j_setup, "status": j_status,
-                    "pnl": round(pnl, 2), "rr": round(rr, 2), "notes": j_notes
-                })
-                save_json(JOURNAL_FILE, st.session_state.journal)
-                st.success("✅ Trade saved!")
-
-        if st.session_state.journal:
-            jdf          = pd.DataFrame(st.session_state.journal)
-            closed       = jdf[jdf["status"] != "OPEN"]
-            wins         = len(jdf[jdf["status"] == "CLOSED WIN"])
-            total_closed = len(closed)
-            win_rate     = wins / total_closed * 100 if total_closed > 0 else 0
-            net_pnl      = float(jdf["pnl"].sum())
-            avg_rr       = float(jdf["rr"].mean())
-
-            jm1, jm2, jm3, jm4 = st.columns(4)
-            for col, lbl, val, color in [
-                (jm1, "NET P&L",     f"₹{net_pnl:,.0f}",     "#00c853" if net_pnl > 0 else "#d32f2f"),
-                (jm2, "WIN RATE",    f"{win_rate:.0f}%",       "#4da6ff"),
-                (jm3, "AVG R:R",     f"{avg_rr:.1f}:1",        "#c084fc"),
-                (jm4, "OPEN TRADES", len(jdf[jdf["status"]=="OPEN"]), "#f9a825"),
-            ]:
-                col.markdown(f"""<div class='metric-card'>
-                    <div class='metric-num' style='color:{color};font-size:22px;'>{val}</div>
-                    <div class='metric-lbl'>{lbl}</div></div>""", unsafe_allow_html=True)
-
-            st.markdown("---")
-            display_cols = ["date","symbol","entry","exit","qty","pnl","rr","status","setup"]
-            available    = [c for c in display_cols if c in jdf.columns]
-            if "pnl" in jdf.columns:
-                st.dataframe(jdf[available].style.map(color_pnl, subset=["pnl"]), use_container_width=True)
-            else:
-                st.dataframe(jdf[available], use_container_width=True)
-
-            # P&L Chart
-            if len(closed) > 1:
-                cs = closed.sort_values("date").copy()
-                cs["cumulative_pnl"] = cs["pnl"].cumsum()
-                fig_pnl = go.Figure()
-                fig_pnl.add_trace(go.Scatter(
-                    x=cs["date"], y=cs["cumulative_pnl"], fill="tozeroy",
-                    line=dict(color="#00c853", width=2), fillcolor="rgba(0,200,83,0.13)",
-                    name="Cumulative P&L"
-                ))
-                fig_pnl.update_layout(
-                    title="Cumulative P&L", paper_bgcolor="#080d14", plot_bgcolor="#080d14",
-                    font=dict(color="#c8d8e8"), height=300, margin=dict(l=40, r=20, t=40, b=20),
-                )
-                fig_pnl.update_xaxes(gridcolor="#0f1c28")
-                fig_pnl.update_yaxes(gridcolor="#0f1c28")
-                st.plotly_chart(fig_pnl, use_container_width=True)
-
-            # Export
-            st.markdown("#### 📤 Export")
-            ex1, ex2 = st.columns(2)
-            with ex1:
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    jdf.to_excel(writer, sheet_name="All Trades", index=False)
-                    pd.DataFrame({
-                        "Metric": ["Total Trades","Open Trades","Closed Trades","Wins","Losses","Win Rate %","Net P&L","Avg R:R"],
-                        "Value":  [len(jdf), len(jdf[jdf["status"]=="OPEN"]), total_closed,
-                                   wins, total_closed-wins, round(win_rate,1), round(net_pnl,2), round(avg_rr,2)]
-                    }).to_excel(writer, sheet_name="Summary", index=False)
-                    open_t = jdf[jdf["status"]=="OPEN"]
-                    if not open_t.empty:
-                        open_t.to_excel(writer, sheet_name="Open Trades", index=False)
-                output.seek(0)
-                st.download_button("📥 Download as Excel", data=output,
-                    file_name=f"TradeJournal_{datetime.today().strftime('%d-%b-%Y')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True)
-            with ex2:
-                st.download_button("📥 Download as CSV", data=jdf.to_csv(index=False).encode("utf-8"),
-                    file_name=f"TradeJournal_{datetime.today().strftime('%d-%b-%Y')}.csv",
-                    mime="text/csv", use_container_width=True)
-
-            st.markdown("---")
-            if st.button("🗑 Clear All Journal Entries"):
-                st.session_state.journal = []
-                save_json(JOURNAL_FILE, [])
-                st.rerun()
-        else:
-            st.info("No trades logged yet. Use the form above to add your first trade.")
+                }), width="stretch")
 
     # ══════════════════════════════════════════════════════════
     # TAB 6 — PRICE ACTION (Fibonacci + Pivot Points)
@@ -1139,7 +1044,7 @@ def main():
         with pa_col3:
             pa_piv_method = st.selectbox("Pivot Method", ["Classic", "Woodie", "Camarilla"], key="pa_piv")
             st.markdown("<br>", unsafe_allow_html=True)
-            load_pa = st.button("📐 Analyse", use_container_width=True)
+            load_pa = st.button("📐 Analyse", width="stretch")
 
         if pa_sym and load_pa:
             with st.spinner(f"Loading {pa_sym}..."):
@@ -1183,7 +1088,7 @@ def main():
                                         else "★★ Strong"   if label in ("38.2%","50.0%","78.6%")
                                         else "★ Moderate",
                     })
-                st.dataframe(pd.DataFrame(fib_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(fib_rows), width="stretch", hide_index=True)
 
                 if fib["near_fib"]:
                     st.markdown(f"""<div class='info-box'>
@@ -1251,7 +1156,7 @@ def main():
                     build_chart(pa_sym, df_pa, result_pa,
                                 show_fib=True, show_pivots=True,
                                 show_pivot_method=pa_piv_method),
-                    use_container_width=True
+                    width="stretch"
                 )
 
                 # ── Section 4: Suggested Trade Setup ─────────────────
@@ -1296,25 +1201,6 @@ def main():
                         Target: {target_lbl} Fib level (₹{target_sugg:,.2f}). {rr_msg}
                     </div>""", unsafe_allow_html=True)
 
-                    # One-click add to journal
-                    st.markdown("#### ➕ Log this Setup")
-                    lc1, lc2, lc3 = st.columns(3)
-                    log_qty = lc1.number_input("Qty", min_value=1, value=10, step=1, key="pa_qty")
-                    log_status = lc2.selectbox("Status", ["OPEN","CLOSED WIN","CLOSED LOSS"], key="pa_status")
-                    log_exit   = lc3.number_input("Exit Price (0=open)", min_value=0.0,
-                                                   value=0.0, step=0.5, key="pa_exit")
-                    if st.button("💾 Add to Trade Journal", use_container_width=True):
-                        pnl = (log_exit - entry_sugg) * log_qty if log_exit > 0 else 0
-                        st.session_state.journal.append({
-                            "symbol": pa_sym, "date": str(datetime.today().date()),
-                            "entry":  entry_sugg, "stop": stop_sugg,
-                            "target": target_sugg, "exit": log_exit,
-                            "qty":    log_qty, "setup": f"Fib Bounce {fib['fib_zone']}",
-                            "status": log_status, "pnl": round(pnl, 2),
-                            "rr":     round(rr, 2), "notes": f"{pa_piv_method} pivot near {nearest_piv}"
-                        })
-                        save_json(JOURNAL_FILE, st.session_state.journal)
-                        st.success("✅ Trade logged to journal!")
                 else:
                     st.markdown("""<div class='warn-box'>
                         ⏳ No Fib Bounce setup at current price.
